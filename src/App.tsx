@@ -1,9 +1,58 @@
 import { useEffect, useRef, useState } from 'react'
 import jsQR from 'jsqr'
+import { decodeWithZXing } from './zxing'
 import './App.css'
+
+const MAX_DECODE_EDGE = 3000
+const MAX_DECODE_PIXELS = 4_000_000
+
+async function decodeImage(image: HTMLImageElement, file: File) {
+  const canvas = document.createElement('canvas')
+  const context = canvas.getContext('2d', { willReadFrequently: true })
+  if (!context) return decodeWithZXing(file)
+
+  const decodeRegion = (x: number, y: number, width: number, height: number, maxEdge: number) => {
+    const scale = Math.min(
+      1,
+      maxEdge / Math.max(width, height),
+      Math.sqrt(MAX_DECODE_PIXELS / (width * height)),
+    )
+    canvas.width = Math.max(1, Math.round(width * scale))
+    canvas.height = Math.max(1, Math.round(height * scale))
+
+    try {
+      context.drawImage(image, x, y, width, height, 0, 0, canvas.width, canvas.height)
+      const pixels = context.getImageData(0, 0, canvas.width, canvas.height)
+      return jsQR(pixels.data, pixels.width, pixels.height, {
+        inversionAttempts: 'attemptBoth',
+      })
+    } catch {
+      // A large image may exceed browser canvas or memory limits; smaller passes can still work.
+      return null
+    }
+  }
+
+  const code = decodeRegion(0, 0, image.width, image.height, 1800)
+  if (code) return code.data
+
+  const highResolutionCode = decodeRegion(0, 0, image.width, image.height, MAX_DECODE_EDGE)
+  if (highResolutionCode) return highResolutionCode.data
+
+  if (Math.max(image.width, image.height) > 1200) {
+    const cropWidth = image.width * 0.7
+    const cropHeight = image.height * 0.7
+    const x = (image.width - cropWidth) / 2
+    const y = (image.height - cropHeight) / 2
+    const croppedCode = decodeRegion(x, y, cropWidth, cropHeight, 1800)
+    if (croppedCode) return croppedCode.data
+  }
+
+  return decodeWithZXing(file)
+}
 
 function App() {
   const inputRef = useRef<HTMLInputElement>(null)
+  const decodeRequestRef = useRef(0)
   const [fileName, setFileName] = useState('')
   const [previewUrl, setPreviewUrl] = useState('')
   const [text, setText] = useState('')
@@ -18,6 +67,7 @@ function App() {
 
   const readFile = (file?: File) => {
     if (!file) return
+    const requestId = ++decodeRequestRef.current
     if (!file.type.startsWith('image/')) {
       setError('画像ファイルを選択してください。')
       return
@@ -31,39 +81,35 @@ function App() {
 
     const image = new Image()
     const imageUrl = URL.createObjectURL(file)
-    image.onload = () => {
-      const scale = Math.min(1, 1800 / Math.max(image.width, image.height))
-      const canvas = document.createElement('canvas')
-      canvas.width = Math.max(1, Math.round(image.width * scale))
-      canvas.height = Math.max(1, Math.round(image.height * scale))
-      const context = canvas.getContext('2d', { willReadFrequently: true })
-      if (!context) {
-        setError('画像を読み込めませんでした。別の画像をお試しください。')
+    image.onload = async () => {
+      try {
+        const result = await decodeImage(image, file)
+        if (decodeRequestRef.current === requestId) {
+          if (result !== null) {
+            setText(result)
+          } else {
+            setError('QRコードを読み取れませんでした。コード全体が写った、明るく鮮明な画像でお試しください。')
+          }
+        }
+      } catch {
+        if (decodeRequestRef.current === requestId) {
+          setError('画像を読み込めませんでした。別の画像をお試しください。')
+        }
+      } finally {
         URL.revokeObjectURL(imageUrl)
-        return
       }
-
-      context.drawImage(image, 0, 0, canvas.width, canvas.height)
-      const pixels = context.getImageData(0, 0, canvas.width, canvas.height)
-      const code = jsQR(pixels.data, pixels.width, pixels.height, {
-        inversionAttempts: 'attemptBoth',
-      })
-
-      if (code) {
-        setText(code.data)
-      } else {
-        setError('QRコードが見つかりませんでした。鮮明な画像でもう一度お試しください。')
-      }
-      URL.revokeObjectURL(imageUrl)
     }
     image.onerror = () => {
-      setError('画像を開けませんでした。別の画像をお試しください。')
+      if (decodeRequestRef.current === requestId) {
+        setError('画像を開けませんでした。別の画像をお試しください。')
+      }
       URL.revokeObjectURL(imageUrl)
     }
     image.src = imageUrl
   }
 
   const reset = () => {
+    decodeRequestRef.current += 1
     setFileName('')
     setPreviewUrl('')
     setText('')
